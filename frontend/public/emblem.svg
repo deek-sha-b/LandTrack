@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <!-- Outer Circular Border -->
+  <circle cx="50" cy="50" r="46" fill="#f8fafc" stroke="#0B2545" stroke-width="4"/>
+  <circle cx="50" cy="50" r="41" fill="none" stroke="#1B5E20" stroke-width="1.5" stroke-dasharray="2,2"/>
+  
+  <!-- Central Emblem Symbol: Stylized Dharmachakra / Cadastral Compass -->
+  <circle cx="50" cy="46" r="18" fill="#ffffff" stroke="#0B2545" stroke-width="2.5"/>
+  <circle cx="50" cy="46" r="4" fill="#0B2545"/>
+  <!-- Spokes -->
+  <path d="M50 28 L50 64 M32 46 L68 46 M37 33 L63 59 M37 59 L63 33" stroke="#0B2545" stroke-width="1.5"/>
+  
+  <!-- Geometric Leaf / Laurel Accents representing Land & Agriculture -->
+  <path d="M22 66 C28 58 36 64 42 70 C34 72 26 72 22 66 Z" fill="#1B5E20"/>
+  <path d="M78 66 C72 58 64 64 58 70 C66 72 74 72 78 66 Z" fill="#1B5E20"/>
+  
+  <!-- Ribbon Base -->
+  <rect x="25" y="74" width="50" height="12" rx="2" fill="#0B2545"/>
+  <text x="50" y="83" fill="#ffffff" font-size="7" font-family="'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle" letter-spacing="1">LANDTRACK</text>
+</svg>

@@ -1,0 +1,96 @@
+================================================================================
+LandTrack - Parcel Acquisition Priority Model Evaluation Report
+================================================================================
+Model Architecture:
+  - Pipeline: scikit-learn Pipeline
+  - Preprocessor: ColumnTransformer
+      * Categorical: OneHotEncoder(handle_unknown='ignore', sparse_output=False) on ['Impact_Type']
+      * Numerical: Passthrough on ['Affected_Area_m2', 'Affected_Percentage']
+  - Classifier: RandomForestClassifier(n_estimators=100, random_state=42)
+
+Features Used (3):
+  1. Affected_Area_m2 (float)
+  2. Affected_Percentage (float, 0-100)
+  3. Impact_Type (category: Full / Partial)
+
+Excluded Columns:
+  - Parcel_ID (identifier only)
+  - Total_Area_m2 (implicit in percentage; not in model feature set)
+  - Land_Type (strictly excluded)
+
+Dataset Summary:
+  - Source: datasets/ml/LandTrack_ML_Dataset.csv
+  - Total Valid Records: 5,000
+  - Training Set (80%):  4,000 records
+  - Test Set (20%):      1,000 records
+  - Split Random State:  42 (stratified)
+
+Training Set Class Distribution:
+Priority
+Low       1494
+Medium    1284
+High      1222
+
+Test Set Class Distribution:
+Priority
+Low       373
+Medium    321
+High      306
+
+================================================================================
+Evaluation Metrics (Held-Out Test Set: n=1,000)
+================================================================================
+Accuracy:           0.9320 (93.20%)
+Macro Precision:    0.9326
+Weighted Precision: 0.9338
+Macro Recall:       0.9307
+Weighted Recall:    0.9320
+Macro F1-Score:     0.9312
+Weighted F1-Score:  0.9325
+
+Classification Report:
+              precision    recall  f1-score   support
+
+        High     0.9622    0.9150    0.9380       306
+         Low     0.9647    0.9517    0.9582       373
+      Medium     0.8710    0.9252    0.8973       321
+
+    accuracy                         0.9320      1000
+   macro avg     0.9326    0.9307    0.9312      1000
+weighted avg     0.9338    0.9320    0.9325      1000
+
+
+Confusion Matrix (Labels: ['High', 'Low', 'Medium']):
+[[280   0  26]
+ [  0 355  18]
+ [ 11  13 297]]
+
+Saved Model Artifact:
+  - Path: ml/landtrack_priority_model.pkl
+  - Size: 4,235,338 bytes
+
+================================================================================
+Synthetic-Data Limitation Notice (Academic & Demonstration Notice)
+================================================================================
+NOTICE:
+The priority classifications ('Low', 'Medium', 'High') and training records in
+this model are derived from synthetic training data created for academic research,
+algorithm development, and software demonstration purposes.
+
+1. Not Official Determinations:
+   The predicted acquisition priorities do NOT represent official government
+   acquisition orders, statutory Gazette notifications, legal awards, or actual
+   Right to Fair Compensation and Transparency in Land Acquisition, Rehabilitation
+   and Resettlement Act (RFCTLARR) decisions.
+
+2. Deterministic Heuristic Approximation:
+   The underlying labels reflect a synthetic composite heuristic based primarily
+   on corridor overlap percentage and affected physical area with stochastic
+   variation. Real-world land acquisition involves multidimensional statutory,
+   environmental, socio-economic, structural valuation, and title verification factors
+   not captured in this synthetic feature set.
+
+3. Demonstration Scope:
+   This model artifact is intended strictly to validate the automated Machine Learning
+   inference pipeline within the LandTrack application stack.
+================================================================================
