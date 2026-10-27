@@ -1,0 +1,1360 @@
+import os
+import sqlite3
+import json
+import csv
+import logging
+import shapely.wkb
+import shapely.geometry
+import shapely.ops
+from shapely.validation import make_valid
+import pyproj
+from sqlalchemy import text
+from config import Config
+from database import get_engine, check_db_connection
+
+logger = logging.getLogger(__name__)
+
+GPKG_PATH = Config.CADASTRAL_FILE
+
+# ---------------------------------------------------------------------------
+# Village Lookup Table Cache (Puttur_Village_Code_Name_Lookup_Complete.csv)
+# ---------------------------------------------------------------------------
+_VILLAGE_LOOKUP_CACHE = None
+
+def get_village_lookup():
+    """
+    Reads Puttur_Village_Code_Name_Lookup_Complete.csv and returns a dictionary:
+    { "617686": "Kabaka (Rural)", "938816": "Putturu", ... }
+    """
+    global _VILLAGE_LOOKUP_CACHE
+    if _VILLAGE_LOOKUP_CACHE is not None:
+        return _VILLAGE_LOOKUP_CACHE
+
+    lookup = {}
+    csv_path = getattr(Config, 'VILLAGE_LOOKUP_FILE', None)
+    if not csv_path or not os.path.exists(csv_path):
+        csv_path = os.path.join(Config.CADASTRAL_DIR, 'Puttur_Village_Code_Name_Lookup_Complete.csv')
+
+    if os.path.exists(csv_path):
+        try:
+            with open(csv_path, mode='r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    code = str(row.get('LGD_VillageCode', '')).strip()
+                    name = str(row.get('Village_Name', '')).strip()
+                    if code and name:
+                        lookup[code] = name
+            logger.info(f"Loaded {len(lookup)} village lookup entries from {csv_path}")
+        except Exception as e:
+            logger.error(f"Error loading village lookup CSV: {e}")
+    else:
+        logger.warning(f"Village lookup CSV not found at: {csv_path}")
+
+    _VILLAGE_LOOKUP_CACHE = lookup
+    return _VILLAGE_LOOKUP_CACHE
+
+def lookup_village_name(lgd_code):
+    """
+    Looks up Village_Name for a given LGD_VillageCode.
+    If code has no match or is invalid/missing, returns 'Not Available'.
+    """
+    if lgd_code is None:
+        return "Not Available"
+    code_str = str(lgd_code).strip()
+    if not code_str or code_str.lower() in ('none', 'null', 'nan', ''):
+        return "Not Available"
+    lookup = get_village_lookup()
+    return lookup.get(code_str, "Not Available")
+
+
+def extract_wkb_from_gpkg_blob(blob):
+    """
+    Extracts WKB from GeoPackage geometry binary.
+    """
+    if not blob or len(blob) < 8:
+        return None
+    if blob[0:2] != b'GP':
+        return None
+    flags = blob[3]
+    envelope_type = (flags >> 1) & 0x07
+    envelope_sizes = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}
+    env_size = envelope_sizes.get(envelope_type, 0)
+    wkb_offset = 8 + env_size
+    return blob[wkb_offset:]
+
+def is_postgis_ready():
+    """
+    Checks if PostgreSQL + PostGIS is connected and has cadastral_parcels table populated.
+    """
+    status = check_db_connection()
+    if not status.get("connected") or not status.get("postgis_installed"):
+        return False
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            res = conn.execute(text("SELECT to_regclass('public.cadastral_parcels');")).scalar()
+            if not res:
+                return False
+            cnt = conn.execute(text("SELECT COUNT(*) FROM cadastral_parcels;")).scalar()
+            return cnt > 0
+    except Exception as e:
+        logger.debug(f"PostGIS check notice: {e}")
+        return False
+
+def get_gpkg_layer_and_srs(gpkg_path):
+    """
+    Inspects a GeoPackage and returns (table_name, srs_id).
+    """
+    if not os.path.exists(gpkg_path):
+        return None, 4326
+    try:
+        conn = sqlite3.connect(gpkg_path)
+        c = conn.cursor()
+        c.execute("SELECT table_name, srs_id FROM gpkg_contents WHERE data_type = 'features' LIMIT 1;")
+        row = c.fetchone()
+        if row:
+            tname, srs = row[0], row[1] or 4326
+        else:
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'gpkg_%' AND name NOT LIKE 'rtree_%' LIMIT 1;")
+            r = c.fetchone()
+            tname = r[0] if r else "putturcadastralfinal"
+            srs = 4326
+        c.execute("SELECT srs_id FROM gpkg_geometry_columns WHERE table_name = ? LIMIT 1;", (tname,))
+        gsrs = c.fetchone()
+        if gsrs and gsrs[0]:
+            srs = gsrs[0]
+        conn.close()
+        return tname, srs
+    except Exception as e:
+        logger.warning(f"Error inspecting GPKG layer: {e}")
+        return "putturcadastralfinal", 4326
+
+def get_cadastral_parcels_postgis(minx=None, miny=None, maxx=None, maxy=None, survey_no=None, village_code=None, parcel_id=None, search=None, limit=25000):
+    """
+    Fetch cadastral parcels from PostgreSQL + PostGIS as GeoJSON FeatureCollection.
+    Supports bbox filtering, survey number, village code, parcel ID / ULPIN, and general search.
+    """
+    engine = get_engine()
+    clauses = ["1=1"]
+    params = {"limit": limit}
+
+    if minx is not None and miny is not None and maxx is not None and maxy is not None:
+        clauses.append("ST_Intersects(geom, ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))")
+        params.update({"minx": minx, "miny": miny, "maxx": maxx, "maxy": maxy})
+
+    if survey_no is not None and str(survey_no).strip():
+        clauses.append("(survey_number = :survey_no OR survey_number_label = :survey_label)")
+        params.update({"survey_no": int(survey_no) if str(survey_no).isdigit() else -1, "survey_label": str(survey_no)})
+
+    if village_code is not None and str(village_code).strip():
+        clauses.append("(kgis_village_code = :vcode OR lgd_village_code = :lgd_code)")
+        params.update({"vcode": str(village_code), "lgd_code": int(village_code) if str(village_code).isdigit() else -1})
+
+    if parcel_id is not None and str(parcel_id).strip():
+        clauses.append("(ulpin ILIKE :pid OR CAST(kgis_cadastral_id AS TEXT) = :pid_exact OR CAST(gpkg_fid AS TEXT) = :pid_exact)")
+        params.update({"pid": f"%{str(parcel_id).strip()}%", "pid_exact": str(parcel_id).strip()})
+
+    if search is not None and str(search).strip():
+        term = str(search).strip()
+        clauses.append("""(
+            CAST(survey_number AS TEXT) = :term OR 
+            survey_number_label ILIKE :term_like OR 
+            ulpin ILIKE :term_like OR 
+            kgis_village_code = :term OR 
+            CAST(lgd_village_code AS TEXT) = :term OR 
+            CAST(kgis_cadastral_id AS TEXT) = :term
+        )""")
+        params.update({"term": term, "term_like": f"%{term}%"})
+
+    where_sql = " AND ".join(clauses)
+    query = text(f"""
+        SELECT 
+            id,
+            gpkg_fid,
+            survey_number,
+            survey_number_label,
+            survey_number_old,
+            kgis_village_code,
+            unique_village_code,
+            bhu_code,
+            lgd_village_code,
+            category,
+            area_sqm,
+            perimeter_m,
+            kharab,
+            ulpin,
+            kgis_cadastral_id,
+            ST_AsGeoJSON(geom) as geojson
+        FROM cadastral_parcels
+        WHERE {where_sql}
+        LIMIT :limit;
+    """)
+
+    features = []
+    with engine.connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+        for r in rows:
+            geom = json.loads(r.geojson) if r.geojson else None
+            area_m2 = r.area_sqm or 0.0
+            acres = round(area_m2 / 4046.86, 3)
+            
+            # Format display survey number
+            survey_display = str(r.survey_number) if r.survey_number is not None else (r.survey_number_label or "Not Available")
+            
+            features.append({
+                "type": "Feature",
+                "id": r.gpkg_fid,
+                "geometry": geom,
+                "properties": {
+                    "fid": r.gpkg_fid,
+                    "survey_number": survey_display,
+                    "village": lookup_village_name(r.lgd_village_code),
+                    "village_code": r.kgis_village_code or "Not Available",
+                    "lgd_village_code": r.lgd_village_code or "Not Available",
+                    "ulpin": r.ulpin or "Not Available",
+                    "area_sqm": round(area_m2, 2),
+                    "area_acres": acres,
+                    "perimeter_m": round(r.perimeter_m or 0.0, 2),
+                    "kharab": r.kharab if r.kharab else "Nil",
+                    "category": r.category or "Parcel",
+                    "kgis_cadastral_id": r.kgis_cadastral_id,
+                    "source": "PostgreSQL / PostGIS"
+                }
+            })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "total_returned": len(features),
+        "source": "PostgreSQL / PostGIS",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}
+        }
+    }
+
+def get_cadastral_parcels_gpkg(minx=None, miny=None, maxx=None, maxy=None, survey_no=None, village_code=None, parcel_id=None, search=None, limit=25000):
+    """
+    Direct spatial query from GPKG using built-in SQLite RTree and Shapely.
+    Ensures zero downtime and immediate visualization with dynamic layer and SRS handling.
+    """
+    if not os.path.exists(GPKG_PATH):
+        return {
+            "type": "FeatureCollection",
+            "features": [],
+            "error": f"GPKG file not found at {GPKG_PATH}",
+            "source": "None"
+        }
+
+    layer_name, srs_id = get_gpkg_layer_and_srs(GPKG_PATH)
+    conn = sqlite3.connect(GPKG_PATH)
+    cursor = conn.cursor()
+
+    use_bbox = minx is not None and miny is not None and maxx is not None and maxy is not None
+
+    # Transformer if source is EPSG:3857
+    transformer_3857_to_4326 = None
+    transformer_4326_to_3857 = None
+    if srs_id == 3857:
+        transformer_3857_to_4326 = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True).transform
+        transformer_4326_to_3857 = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
+
+    rtree_table = f"rtree_{layer_name}_geom"
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?;", (rtree_table,))
+    has_rtree = cursor.fetchone() is not None
+
+    if use_bbox and has_rtree:
+        q_minx, q_miny, q_maxx, q_maxy = minx, miny, maxx, maxy
+        if transformer_4326_to_3857:
+            p1x, p1y = transformer_4326_to_3857(minx, miny)
+            p2x, p2y = transformer_4326_to_3857(maxx, maxy)
+            q_minx, q_maxx = min(p1x, p2x), max(p1x, p2x)
+            q_miny, q_maxy = min(p1y, p2y), max(p1y, p2y)
+
+        sql = f"""
+            SELECT 
+                p.fid,
+                p.geom,
+                p.surveynumberi,
+                p.Label,
+                p.Surveynumber_Old,
+                p.KGISVillageCode,
+                p.UniqueVillageCode,
+                p.bhucode,
+                p.LGD_VillageCode,
+                p.Category,
+                p."SHAPE.STArea()",
+                p."SHAPE.STLength()",
+                p.Kharab,
+                p.ULPIN,
+                p.KGISCadastralID
+            FROM "{rtree_table}" r
+            JOIN "{layer_name}" p ON r.id = p.fid
+            WHERE r.minx <= ? AND r.maxx >= ? AND r.miny <= ? AND r.maxy >= ?
+        """
+        params = [q_maxx, q_minx, q_maxy, q_miny]
+        if survey_no:
+            sql += " AND (p.surveynumberi = ? OR p.Label = ?)"
+            params.extend([survey_no, str(survey_no)])
+        if village_code:
+            sql += " AND (p.KGISVillageCode = ? OR p.LGD_VillageCode = ?)"
+            params.extend([str(village_code), str(village_code)])
+        if parcel_id:
+            sql += " AND (p.ULPIN LIKE ? OR p.KGISCadastralID = ? OR p.fid = ?)"
+            params.extend([f"%{parcel_id}%", str(parcel_id), str(parcel_id)])
+        if search:
+            sql += " AND (p.surveynumberi = ? OR p.Label LIKE ? OR p.ULPIN LIKE ? OR p.KGISVillageCode = ? OR p.LGD_VillageCode = ?)"
+            params.extend([str(search), f"%{search}%", f"%{search}%", str(search), str(search)])
+        sql += " LIMIT ?"
+        params.append(limit)
+    else:
+        sql = f"""
+            SELECT 
+                fid,
+                geom,
+                surveynumberi,
+                Label,
+                Surveynumber_Old,
+                KGISVillageCode,
+                UniqueVillageCode,
+                bhucode,
+                LGD_VillageCode,
+                Category,
+                "SHAPE.STArea()",
+                "SHAPE.STLength()",
+                Kharab,
+                ULPIN,
+                KGISCadastralID
+            FROM "{layer_name}"
+            WHERE 1=1
+        """
+        params = []
+        if survey_no:
+            sql += " AND (surveynumberi = ? OR Label = ?)"
+            params.extend([survey_no, str(survey_no)])
+        if village_code:
+            sql += " AND (KGISVillageCode = ? OR LGD_VillageCode = ?)"
+            params.extend([str(village_code), str(village_code)])
+        if parcel_id:
+            sql += " AND (ULPIN LIKE ? OR KGISCadastralID = ? OR fid = ?)"
+            params.extend([f"%{parcel_id}%", str(parcel_id), str(parcel_id)])
+        if search:
+            sql += " AND (surveynumberi = ? OR Label LIKE ? OR ULPIN LIKE ? OR KGISVillageCode = ? OR LGD_VillageCode = ?)"
+            params.extend([str(search), f"%{search}%", f"%{search}%", str(search), str(search)])
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    features = []
+
+    for r in rows:
+        fid = r[0]
+        geom_blob = r[1]
+        wkb = extract_wkb_from_gpkg_blob(geom_blob)
+        if not wkb:
+            continue
+        try:
+            shapely_geom = shapely.wkb.loads(wkb)
+            if transformer_3857_to_4326:
+                shapely_geom = shapely.ops.transform(transformer_3857_to_4326, shapely_geom)
+            geom_json = shapely.geometry.mapping(shapely_geom)
+        except Exception:
+            continue
+
+        survey_val = r[2]
+        survey_display = str(survey_val) if survey_val is not None else (r[3] or "Not Available")
+        area_m2 = r[10] or 0.0
+        acres = round(area_m2 / 4046.86, 3)
+
+        features.append({
+            "type": "Feature",
+            "id": fid,
+            "geometry": geom_json,
+            "properties": {
+                "fid": fid,
+                "survey_number": survey_display,
+                "village": lookup_village_name(r[8]),
+                "village_code": r[5] or "Not Available",
+                "unique_village_code": r[6] or "Not Available",
+                "bhu_code": r[7] or "Not Available",
+                "lgd_village_code": r[8] if r[8] is not None else "Not Available",
+                "category": r[9] or "Parcel",
+                "area_sqm": round(area_m2, 2),
+                "area_acres": acres,
+                "perimeter_m": round(r[11] or 0.0, 2),
+                "kharab": r[12] if r[12] else "Nil",
+                "ulpin": r[13] if r[13] else "Not Available",
+                "kgis_cadastral_id": r[14],
+                "source": f"GeoPackage ({os.path.basename(Config.CADASTRAL_FILE)})"
+            }
+        })
+
+    conn.close()
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "total_returned": len(features),
+        "source": f"GeoPackage ({os.path.basename(Config.CADASTRAL_FILE)})",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}
+        }
+    }
+
+def get_cadastral_geojson(minx=None, miny=None, maxx=None, maxy=None, survey_no=None, village_code=None, parcel_id=None, search=None, limit=25000):
+    """
+    Primary accessor: uses PostgreSQL/PostGIS if available, otherwise GPKG.
+    """
+    if is_postgis_ready():
+        try:
+            return get_cadastral_parcels_postgis(minx, miny, maxx, maxy, survey_no, village_code, parcel_id, search, limit)
+        except Exception as e:
+            logger.warning(f"Error querying PostGIS, falling back to GPKG: {e}")
+            return get_cadastral_parcels_gpkg(minx, miny, maxx, maxy, survey_no, village_code, parcel_id, search, limit)
+    else:
+        return get_cadastral_parcels_gpkg(minx, miny, maxx, maxy, survey_no, village_code, parcel_id, search, limit)
+
+def get_cadastral_metadata():
+    """
+    Returns dataset metadata and system status for frontend headers and dashboard.
+    Dynamically computes count and extent from PostGIS or GPKG source.
+    """
+    postgis_active = is_postgis_ready()
+    tname, srs = get_gpkg_layer_and_srs(Config.CADASTRAL_FILE)
+    total_parcels = 11304
+    bbox = {
+        "min_lon": 75.140390,
+        "min_lat": 12.568562,
+        "max_lon": 75.349885,
+        "max_lat": 12.859625
+    }
+    center = {
+        "lat": round((bbox["min_lat"] + bbox["max_lat"]) / 2, 4),
+        "lng": round((bbox["min_lon"] + bbox["max_lon"]) / 2, 4)
+    }
+
+    if postgis_active:
+        try:
+            engine = get_engine()
+            with engine.connect() as conn:
+                cnt = conn.execute(text("SELECT COUNT(*) FROM cadastral_parcels;")).scalar()
+                if cnt:
+                    total_parcels = cnt
+                ext_str = conn.execute(text("SELECT ST_Extent(geom) FROM cadastral_parcels;")).scalar()
+                if ext_str:
+                    parts = ext_str.replace("BOX(", "").replace(")", "").replace(",", " ").split()
+                    if len(parts) == 4:
+                        bbox = {
+                            "min_lon": round(float(parts[0]), 6),
+                            "min_lat": round(float(parts[1]), 6),
+                            "max_lon": round(float(parts[2]), 6),
+                            "max_lat": round(float(parts[3]), 6)
+                        }
+                        center = {
+                            "lat": round((bbox["min_lat"] + bbox["max_lat"]) / 2, 4),
+                            "lng": round((bbox["min_lon"] + bbox["max_lon"]) / 2, 4)
+                        }
+        except Exception as e:
+            logger.debug(f"Notice fetching live metadata from PostGIS: {e}")
+
+    return {
+        "dataset_name": os.path.basename(Config.CADASTRAL_FILE),
+        "layer_name": tname or "putturcadastralfinal",
+        "crs": "EPSG:4326 (WGS 84)",
+        "source_crs": f"EPSG:{srs}",
+        "geometry_type": "MULTIPOLYGON",
+        "total_parcels": total_parcels,
+        "study_area": "Puttur Taluk, Dakshina Kannada, Karnataka, India",
+        "center": center,
+        "bbox": bbox,
+        "active_backend_source": "PostgreSQL / PostGIS" if postgis_active else f"OGC GeoPackage ({os.path.basename(Config.CADASTRAL_FILE)})",
+        "postgis_connected": postgis_active
+    }
+
+# ============================================================================
+# PUTTUR ROADS & HIGHWAYS SERVICES
+# ============================================================================
+
+ROADS_FILE = Config.ROADS_FILE
+ROADS_GPKG = getattr(Config, 'ROADS_GPKG', os.path.join(Config.ROADS_DIR, 'putturroadfinal.gpkg'))
+
+# Spatial projection transformers for Puttur Taluk, Karnataka (UTM Zone 43N)
+_PROJ_WGS84_TO_UTM43N = None
+_PROJ_UTM43N_TO_WGS84 = None
+
+def get_utm_transformers():
+    """
+    Returns (to_utm, to_wgs84) pyproj coordinate transformers for EPSG:4326 <-> EPSG:32643.
+    """
+    global _PROJ_WGS84_TO_UTM43N, _PROJ_UTM43N_TO_WGS84
+    if _PROJ_WGS84_TO_UTM43N is None:
+        wgs84 = pyproj.CRS("EPSG:4326")
+        utm43n = pyproj.CRS("EPSG:32643")
+        _PROJ_WGS84_TO_UTM43N = pyproj.Transformer.from_crs(wgs84, utm43n, always_xy=True).transform
+        _PROJ_UTM43N_TO_WGS84 = pyproj.Transformer.from_crs(utm43n, wgs84, always_xy=True).transform
+    return _PROJ_WGS84_TO_UTM43N, _PROJ_UTM43N_TO_WGS84
+
+def is_roads_postgis_ready():
+    """
+    Checks if PostgreSQL + PostGIS is connected and has puttur_roads table populated.
+    """
+    status = check_db_connection()
+    if not status.get("connected") or not status.get("postgis_installed"):
+        return False
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            res = conn.execute(text("SELECT to_regclass('public.puttur_roads');")).scalar()
+            if not res:
+                return False
+            cnt = conn.execute(text("SELECT COUNT(*) FROM puttur_roads;")).scalar()
+            return cnt > 0
+    except Exception as e:
+        logger.debug(f"PostGIS roads check notice: {e}")
+        return False
+
+def get_roads_postgis():
+    """
+    Fetch Puttur road features from PostgreSQL + PostGIS table 'puttur_roads'.
+    """
+    engine = get_engine()
+    query = text("""
+        SELECT 
+            id,
+            osm_id,
+            osm_type,
+            full_id,
+            name,
+            name_kn,
+            name_en,
+            ref,
+            ref_old,
+            highway,
+            lanes,
+            surface,
+            maxspeed,
+            bridge,
+            tunnel,
+            layer,
+            width,
+            oneway,
+            length_m,
+            ST_AsGeoJSON(geom) as geojson
+        FROM puttur_roads
+        ORDER BY id ASC;
+    """)
+
+    features = []
+    with engine.connect() as conn:
+        rows = conn.execute(query).fetchall()
+        for r in rows:
+            geom = json.loads(r.geojson) if r.geojson else None
+            features.append({
+                "type": "Feature",
+                "id": r.id,
+                "geometry": geom,
+                "properties": {
+                    "id": r.id,
+                    "osm_id": r.osm_id,
+                    "osm_type": r.osm_type or "way",
+                    "full_id": r.full_id or "",
+                    "name": r.name,
+                    "name_kn": r.name_kn or "",
+                    "name_en": r.name_en or "",
+                    "ref": r.ref,
+                    "ref_old": r.ref_old or "",
+                    "highway": r.highway or "road",
+                    "lanes": r.lanes,
+                    "surface": r.surface,
+                    "maxspeed": r.maxspeed,
+                    "bridge": r.bridge,
+                    "tunnel": r.tunnel,
+                    "layer": r.layer,
+                    "width": r.width,
+                    "oneway": r.oneway,
+                    "length_m": round(r.length_m or 0.0, 1),
+                    "length_km": round((r.length_m or 0.0) / 1000.0, 2),
+                    "source": "PostgreSQL / PostGIS"
+                }
+            })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "total_returned": len(features),
+        "source": "PostgreSQL / PostGIS (puttur_roads)",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}
+        }
+    }
+
+def get_roads_gpkg():
+    """
+    Direct spatial query from GeoPackage (putturroadfinal.gpkg) as fallback.
+    """
+    gpkg_path = ROADS_GPKG if os.path.exists(ROADS_GPKG) else Config.ROADS_FILE
+    if not os.path.exists(gpkg_path) or not gpkg_path.endswith('.gpkg'):
+        return {
+            "type": "FeatureCollection",
+            "features": [],
+            "error": f"Roads GeoPackage not found at {gpkg_path}",
+            "source": "None"
+        }
+
+    conn = sqlite3.connect(gpkg_path)
+    c = conn.cursor()
+    c.execute("SELECT table_name FROM gpkg_contents WHERE data_type = 'features' LIMIT 1")
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return {"type": "FeatureCollection", "features": [], "source": "None"}
+    table_name = row[0]
+
+    c.execute(f"PRAGMA table_info(\"{table_name}\")")
+    cols = [col[1] for col in c.fetchall()]
+
+    c.execute(f"SELECT * FROM \"{table_name}\"")
+    rows = c.fetchall()
+    conn.close()
+
+    to_utm, _ = get_utm_transformers()
+    features = []
+
+    for r in rows:
+        row_dict = {cols[i]: r[i] for i in range(len(cols))}
+        blob = row_dict.get("geom")
+        wkb = extract_wkb_from_gpkg_blob(blob)
+        if not wkb:
+            continue
+        try:
+            geom = shapely.wkb.loads(wkb)
+            if geom.is_empty:
+                continue
+            geom_utm = shapely.ops.transform(to_utm, geom)
+            length_m = geom_utm.length
+            geom_json = shapely.geometry.mapping(geom)
+        except Exception:
+            continue
+
+        fid = row_dict.get("fid")
+        osm_id = row_dict.get("osm_id") or row_dict.get("full_id") or f"road_{fid}"
+
+        features.append({
+            "type": "Feature",
+            "id": fid,
+            "geometry": geom_json,
+            "properties": {
+                "id": fid,
+                "osm_id": str(osm_id),
+                "osm_type": str(row_dict.get("osm_type") or "way"),
+                "full_id": str(row_dict.get("full_id") or ""),
+                "name": row_dict.get("name"),
+                "name_kn": row_dict.get("name:kn") or "",
+                "name_en": row_dict.get("name:en") or "",
+                "ref": row_dict.get("ref"),
+                "ref_old": row_dict.get("ref:old") or "",
+                "highway": row_dict.get("highway") or "road",
+                "lanes": row_dict.get("lanes"),
+                "surface": row_dict.get("surface"),
+                "maxspeed": row_dict.get("maxspeed"),
+                "bridge": row_dict.get("bridge"),
+                "tunnel": row_dict.get("tunnel"),
+                "layer": row_dict.get("layer"),
+                "width": row_dict.get("width"),
+                "oneway": row_dict.get("oneway"),
+                "length_m": round(length_m, 1),
+                "length_km": round(length_m / 1000.0, 2),
+                "source": f"GeoPackage ({os.path.basename(gpkg_path)})"
+            }
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "total_returned": len(features),
+        "source": f"GeoPackage ({os.path.basename(gpkg_path)})",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}
+        }
+    }
+
+_ROADS_GEOJSON_CACHE = None
+_ROADS_INDEX_CACHE = None
+
+def get_roads_geojson(force_refresh=False):
+    """
+    Primary accessor for roads: uses PostGIS if ready, otherwise GeoPackage fallback.
+    Caches result in memory for instantaneous sub-millisecond retrieval.
+    """
+    global _ROADS_GEOJSON_CACHE, _ROADS_INDEX_CACHE
+    if not force_refresh and _ROADS_GEOJSON_CACHE is not None:
+        return _ROADS_GEOJSON_CACHE
+
+    if is_roads_postgis_ready():
+        try:
+            fc = get_roads_postgis()
+        except Exception as e:
+            logger.warning(f"Error querying roads from PostGIS, falling back to GeoPackage: {e}")
+            fc = get_roads_gpkg()
+    else:
+        fc = get_roads_gpkg()
+
+    _ROADS_GEOJSON_CACHE = fc
+    # Build fast O(1) index for road lookups by id and osm_id
+    index = {}
+    for f in fc.get("features", []):
+        fid = f.get("id")
+        osm_id = f.get("properties", {}).get("osm_id")
+        if fid is not None:
+            index[str(fid)] = f
+        if osm_id is not None:
+            index[str(osm_id)] = f
+    _ROADS_INDEX_CACHE = index
+    return _ROADS_GEOJSON_CACHE
+
+def get_road_group_key(props):
+    """
+    Computes normalized road group key based on reliable road attributes:
+    1. 'ref' (highway reference number e.g. NH275, NH75, SH100, SH88, LR, etc.)
+    2. 'name' (road name e.g. 'Vivekananda College Road', 'Puttur - Panaje road')
+    3. 'id' / 'osm_id' (for unnamed roads with no ref, preserving them individually)
+    """
+    if not props:
+        return None
+    ref_val = props.get("ref")
+    clean_ref = str(ref_val).strip() if ref_val and str(ref_val).strip().lower() not in ('none', 'null', 'nan', '') else None
+    if clean_ref:
+        norm_ref = clean_ref.replace(" ", "").upper()
+        # SH100 road should not be combined across segments
+        if norm_ref == "SH100":
+            osm_id = props.get("osm_id") or props.get("id") or props.get("fid")
+            return f"ID:{osm_id}"
+        return "REF:" + norm_ref
+
+    name_val = props.get("name")
+    clean_name = str(name_val).strip() if name_val and str(name_val).strip().lower() not in ('none', 'null', 'nan', '') else None
+    if clean_name:
+        if "ninthikal" in clean_name.lower() or clean_name.lower() == "sh100":
+            osm_id = props.get("osm_id") or props.get("id") or props.get("fid")
+            return f"ID:{osm_id}"
+        return "NAME:" + clean_name.lower()
+
+    osm_id = props.get("osm_id") or props.get("id") or props.get("fid")
+    return f"ID:{osm_id}"
+
+def get_complete_road_feature(road_feature_or_id):
+    """
+    Returns the complete road feature uniting all available segments belonging
+    to the same road (by reference number or name).
+    If the road has only 1 segment or is an unnamed road, returns that feature.
+    If multi-segment, merges all segment geometries into a clean MultiLineString/LineString
+    using shapely.ops.unary_union and aggregates total route length.
+    """
+    target = None
+    if isinstance(road_feature_or_id, (int, str)):
+        target = get_road_by_id(road_feature_or_id, complete=False)
+    elif isinstance(road_feature_or_id, dict):
+        target = road_feature_or_id
+
+    if not target:
+        return None
+
+    # If already unified with complete route flag, return
+    if target.get("properties", {}).get("is_complete_route") and target.get("geometry"):
+        return target
+
+    fc = get_roads_geojson()
+    features = fc.get("features", [])
+    target_props = target.get("properties", {})
+    group_key = get_road_group_key(target_props)
+
+    if not group_key or group_key.startswith("ID:"):
+        return target
+
+    matching_segments = [f for f in features if get_road_group_key(f.get("properties", {})) == group_key]
+
+    if len(matching_segments) <= 1:
+        return target
+
+    # Merge geometries
+    shapes = []
+    total_length_m = 0.0
+    names = set()
+    refs = set()
+    highways = set()
+
+    for seg in matching_segments:
+        g = seg.get("geometry")
+        if g:
+            try:
+                s = shapely.geometry.shape(g)
+                if not s.is_empty:
+                    shapes.append(s)
+            except Exception:
+                pass
+        p = seg.get("properties", {})
+        total_length_m += float(p.get("length_m", 0) or 0)
+        if p.get("name") and str(p.get("name")).lower() not in ('none', 'null', 'nan', ''):
+            names.add(str(p.get("name")).strip())
+        if p.get("ref") and str(p.get("ref")).lower() not in ('none', 'null', 'nan', ''):
+            refs.add(str(p.get("ref")).strip())
+        if p.get("highway"):
+            highways.add(str(p.get("highway")).strip())
+
+    if not shapes:
+        return target
+
+    merged_shape = shapely.ops.unary_union(shapes)
+    merged_geom = shapely.geometry.mapping(merged_shape)
+
+    # Pick canonical name and ref
+    canonical_name = target_props.get("name")
+    if not canonical_name or str(canonical_name).lower() in ('none', 'null', 'nan', ''):
+        canonical_name = next(iter(names), None)
+
+    canonical_ref = target_props.get("ref")
+    if not canonical_ref or str(canonical_ref).lower() in ('none', 'null', 'nan', ''):
+        canonical_ref = next(iter(refs), None)
+
+    combined_props = dict(target_props)
+    combined_props.update({
+        "name": canonical_name,
+        "ref": canonical_ref,
+        "highway": target_props.get("highway") or (next(iter(highways), "road")),
+        "total_segments": len(matching_segments),
+        "length_m": round(total_length_m, 1),
+        "length_km": round(total_length_m / 1000.0, 2),
+        "is_complete_route": True
+    })
+
+    return {
+        "type": "Feature",
+        "id": target.get("id") or target_props.get("osm_id") or group_key,
+        "geometry": merged_geom,
+        "properties": combined_props
+    }
+
+def get_road_by_id(road_id, complete=True):
+    """
+    Retrieves a road feature by its ID, osm_id, ref, or name.
+    If complete=True, returns the complete unified road feature across all its segments.
+    """
+    found_feature = None
+    if is_roads_postgis_ready():
+        engine = get_engine()
+        query = text("""
+            SELECT 
+                id, osm_id, osm_type, full_id, name, name_kn, name_en, ref, ref_old,
+                highway, lanes, surface, maxspeed, bridge, tunnel, layer, width, oneway,
+                length_m, ST_AsGeoJSON(geom) as geojson
+            FROM puttur_roads
+            WHERE id = :rid OR osm_id = :osm_id_str OR ref ILIKE :ref_str OR name ILIKE :name_str
+            LIMIT 1;
+        """)
+        rid_val = int(road_id) if str(road_id).isdigit() else -1
+        with engine.connect() as conn:
+            r = conn.execute(query, {
+                "rid": rid_val,
+                "osm_id_str": str(road_id),
+                "ref_str": str(road_id),
+                "name_str": str(road_id)
+            }).fetchone()
+            if r:
+                geom = json.loads(r.geojson) if r.geojson else None
+                found_feature = {
+                    "type": "Feature",
+                    "id": r.id,
+                    "geometry": geom,
+                    "properties": {
+                        "id": r.id,
+                        "osm_id": r.osm_id,
+                        "osm_type": r.osm_type or "way",
+                        "full_id": r.full_id or "",
+                        "name": r.name,
+                        "name_kn": r.name_kn or "",
+                        "name_en": r.name_en or "",
+                        "ref": r.ref,
+                        "ref_old": r.ref_old or "",
+                        "highway": r.highway or "road",
+                        "lanes": r.lanes,
+                        "surface": r.surface,
+                        "maxspeed": r.maxspeed,
+                        "bridge": r.bridge,
+                        "tunnel": r.tunnel,
+                        "layer": r.layer,
+                        "width": r.width,
+                        "oneway": r.oneway,
+                        "length_m": round(r.length_m or 0.0, 1),
+                        "length_km": round((r.length_m or 0.0) / 1000.0, 2),
+                        "source": "PostgreSQL / PostGIS"
+                    }
+                }
+
+    if not found_feature:
+        # Fallback to fast indexed lookup from memory cache
+        global _ROADS_INDEX_CACHE
+        if _ROADS_INDEX_CACHE is None:
+            get_roads_geojson()
+        if _ROADS_INDEX_CACHE:
+            found_feature = _ROADS_INDEX_CACHE.get(str(road_id))
+            if not found_feature and _ROADS_GEOJSON_CACHE:
+                # Search by ref or name
+                r_str = str(road_id).strip().lower()
+                for f in _ROADS_GEOJSON_CACHE.get("features", []):
+                    p = f.get("properties", {})
+                    if (p.get("ref") and str(p.get("ref")).strip().lower() == r_str) or \
+                       (p.get("name") and str(p.get("name")).strip().lower() == r_str):
+                        found_feature = f
+                        break
+
+    if found_feature and complete:
+        return get_complete_road_feature(found_feature)
+    return found_feature
+
+def get_roads_metadata():
+    """
+    Returns Puttur road dataset inspection metadata:
+    actual file format, location, CRS, geometry type, available attributes, and extent.
+    """
+    postgis_active = is_roads_postgis_ready()
+    gpkg_path = ROADS_GPKG if os.path.exists(ROADS_GPKG) else Config.ROADS_FILE
+    is_gpkg = gpkg_path.endswith('.gpkg')
+
+    num_features = 1050
+    total_length_km = 642.54
+
+    if postgis_active:
+        try:
+            engine = get_engine()
+            with engine.connect() as conn:
+                num_features = conn.execute(text("SELECT COUNT(*) FROM puttur_roads;")).scalar() or 1050
+                tot_m = conn.execute(text("SELECT SUM(length_m) FROM puttur_roads;")).scalar() or (642.54 * 1000)
+                total_length_km = round(tot_m / 1000.0, 2)
+        except Exception:
+            pass
+
+    return {
+        "file_name": os.path.basename(gpkg_path),
+        "file_path": gpkg_path,
+        "file_format": "OGC GeoPackage (.gpkg)" if is_gpkg else "GeoJSON",
+        "layer_name": "puttur road",
+        "crs": "EPSG:4326 (WGS 84)",
+        "projected_crs": "EPSG:32643 (UTM Zone 43N, Karnataka)",
+        "geometry_type": "MultiLineString",
+        "road_name_field": "name",
+        "road_number_field": "ref",
+        "unique_road_id_field": "osm_id",
+        "number_of_features": num_features,
+        "total_network_length_km": total_length_km,
+        "study_area": "Puttur Taluk, Karnataka, India",
+        "bbox": {
+            "min_lon": 75.142037,
+            "min_lat": 12.569761,
+            "max_lon": 75.343430,
+            "max_lat": 12.854503
+        },
+        "available_attributes": [
+            "osm_id", "osm_type", "full_id", "name", "name_kn", "name_en",
+            "ref", "ref_old", "highway", "lanes", "surface", "maxspeed",
+            "bridge", "tunnel", "layer", "width", "oneway", "length_m"
+        ],
+        "active_backend_source": "PostgreSQL / PostGIS (puttur_roads)" if postgis_active else f"OGC GeoPackage ({os.path.basename(gpkg_path)})",
+        "postgis_connected": postgis_active
+    }
+
+def generate_corridor_buffer_service(road_feature_or_id, width_meters=30.0):
+    """
+    Generates a GIS buffer (acquisition corridor) around a road feature.
+    Correctly transforms geometry to projected CRS EPSG:32643 (UTM Zone 43N)
+    for exact metric distance calculations, then transforms back to EPSG:4326.
+    Corridor width W creates a buffer of radius W/2 on either side (total width = W).
+    """
+    try:
+        width_m = float(width_meters)
+        if width_m <= 0:
+            width_m = 30.0
+    except (ValueError, TypeError):
+        width_m = 30.0
+
+    buffer_radius_m = width_m / 2.0
+
+    # Ensure complete road feature is used
+    feature = None
+    if isinstance(road_feature_or_id, (int, str)):
+        feature = get_complete_road_feature(road_feature_or_id)
+    elif isinstance(road_feature_or_id, dict):
+        feature = get_complete_road_feature(road_feature_or_id)
+
+    if not feature:
+        return None
+
+    geom_dict = feature.get("geometry") if feature.get("type") == "Feature" else feature
+    if not geom_dict:
+        return None
+
+    # PostGIS fast path
+    if is_roads_postgis_ready():
+        try:
+            engine = get_engine()
+            query = text("""
+                SELECT ST_AsGeoJSON(
+                    ST_Transform(
+                        ST_Buffer(
+                            ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON(:geom_json), 4326), 32643),
+                            :radius_m
+                        ),
+                        4326
+                    )
+                ) as corridor_json;
+            """)
+            with engine.connect() as conn:
+                res = conn.execute(query, {
+                    "geom_json": json.dumps(geom_dict),
+                    "radius_m": buffer_radius_m
+                }).scalar()
+                if res:
+                    corridor_geom = json.loads(res)
+                    return {
+                        "type": "Feature",
+                        "geometry": corridor_geom,
+                        "properties": {
+                            "width_meters": width_m,
+                            "buffer_radius_meters": buffer_radius_m,
+                            "projected_crs": "EPSG:32643",
+                            "display_crs": "EPSG:4326",
+                            "road_id": feature.get("id"),
+                            "road_name": feature.get("properties", {}).get("name"),
+                            "road_ref": feature.get("properties", {}).get("ref")
+                        }
+                    }
+        except Exception as e:
+            logger.warning(f"PostGIS buffer calculation notice, falling back to pyproj: {e}")
+
+    # Shapely + Pyproj fallback
+    to_utm, to_wgs84 = get_utm_transformers()
+    road_shape = shapely.geometry.shape(geom_dict)
+    if not road_shape.is_valid:
+        road_shape = make_valid(road_shape)
+
+    road_utm = shapely.ops.transform(to_utm, road_shape)
+    corridor_utm = road_utm.buffer(buffer_radius_m)
+    corridor_wgs84 = shapely.ops.transform(to_wgs84, corridor_utm)
+
+    return {
+        "type": "Feature",
+        "geometry": shapely.geometry.mapping(corridor_wgs84),
+        "properties": {
+            "width_meters": width_m,
+            "buffer_radius_meters": buffer_radius_m,
+            "projected_crs": "EPSG:32643",
+            "display_crs": "EPSG:4326",
+            "road_id": feature.get("id"),
+            "road_name": feature.get("properties", {}).get("name"),
+            "road_ref": feature.get("properties", {}).get("ref")
+        }
+    }
+
+def intersect_corridor_with_parcels(corridor_geojson, impact_threshold=90.0, road_details=None):
+    """
+    Performs spatial intersection between the acquisition corridor and Puttur cadastral parcels.
+    Calculates:
+      - Total parcel area in square metres
+      - Affected area within the corridor in square metres
+      - Percentage of the parcel affected
+      - Impact classification: 'Full Impact' (>= impact_threshold, default 90.0%) or 'Partial Impact'
+      - Full parcel and road identifiers to trace back to source data.
+    Uses PostGIS with UTM Zone 43N (EPSG:32643) for precise metric area calculations,
+    or GeoPackage RTree fallback. Avoids duplicate parcels.
+    """
+    if not corridor_geojson:
+        return {
+            "error": "Corridor GeoJSON is required",
+            "parcels": [],
+            "summary": {"total_affected_parcels": 0, "partial_impact_count": 0, "full_impact_count": 0}
+        }
+
+    geom_dict = corridor_geojson.get("geometry") if corridor_geojson.get("type") == "Feature" else corridor_geojson
+    if not geom_dict:
+        return {
+            "error": "Invalid corridor geometry",
+            "parcels": [],
+            "summary": {"total_affected_parcels": 0, "partial_impact_count": 0, "full_impact_count": 0}
+        }
+
+    road_meta = road_details or {}
+    road_name_val = road_meta.get("road_name") or road_meta.get("name") or "Highway Alignment"
+    road_ref_val = road_meta.get("road_ref") or road_meta.get("ref") or ""
+    corridor_width_val = road_meta.get("width") or road_meta.get("width_meters") or "30"
+
+    # PostGIS fast path
+    if is_postgis_ready():
+        try:
+            engine = get_engine()
+            corridor_json_str = json.dumps(geom_dict)
+            query = text("""
+                SELECT 
+                    p.id,
+                    p.gpkg_fid,
+                    p.survey_number,
+                    p.survey_number_label,
+                    p.kgis_village_code,
+                    p.lgd_village_code,
+                    p.category,
+                    p.area_sqm,
+                    p.perimeter_m,
+                    p.kharab,
+                    p.ulpin,
+                    p.kgis_cadastral_id,
+                    ST_Area(ST_Transform(p.geom, 32643)) as calc_total_sqm,
+                    ST_Area(ST_Transform(ST_Intersection(p.geom, ST_SetSRID(ST_GeomFromGeoJSON(:corridor_json), 4326)), 32643)) as calc_affected_sqm,
+                    ST_AsGeoJSON(p.geom) as geom_json
+                FROM cadastral_parcels p
+                WHERE ST_Intersects(p.geom, ST_SetSRID(ST_GeomFromGeoJSON(:corridor_json), 4326))
+                ORDER BY calc_affected_sqm DESC;
+            """)
+
+            affected_list = []
+            partial_count = 0
+            full_count = 0
+            seen_fids = set()
+
+            with engine.connect() as conn:
+                rows = conn.execute(query, {"corridor_json": corridor_json_str}).fetchall()
+                for r in rows:
+                    fid = r.gpkg_fid
+                    if fid in seen_fids:
+                        continue
+                    seen_fids.add(fid)
+
+                    total_sqm = float(r.area_sqm or r.calc_total_sqm or 0.0)
+                    affected_sqm = float(r.calc_affected_sqm or 0.0)
+                    if affected_sqm <= 0:
+                        continue
+
+                    if total_sqm <= 0:
+                        total_sqm = affected_sqm
+
+                    affected_pct = round(min(100.0, (affected_sqm / total_sqm) * 100.0), 2)
+                    impact_type = "Full Impact" if affected_pct >= float(impact_threshold) else "Partial Impact"
+
+                    if impact_type == "Full Impact":
+                        full_count += 1
+                    else:
+                        partial_count += 1
+
+                    survey_no = str(r.survey_number) if r.survey_number is not None and str(r.survey_number) != 'None' else (str(r.survey_number_label) if r.survey_number_label and str(r.survey_number_label) != 'None' else "Not Available")
+                    parcel_id = str(r.kgis_cadastral_id) if r.kgis_cadastral_id and str(r.kgis_cadastral_id) != 'None' else (str(r.ulpin) if r.ulpin and str(r.ulpin) != 'None' else f"PARCEL-{fid}")
+                    village_name = lookup_village_name(r.lgd_village_code)
+                    geom = json.loads(r.geom_json) if r.geom_json else None
+
+                    affected_list.append({
+                        "id": fid,
+                        "parcel_id": parcel_id,
+                        "survey_number": survey_no,
+                        "village": village_name,
+                        "village_code": r.kgis_village_code or "Not Available",
+                        "lgd_village_code": r.lgd_village_code if r.lgd_village_code is not None else "Not Available",
+                        "category": r.category or "Parcel",
+                        "ulpin": r.ulpin or "Not Available",
+                        "kgis_cadastral_id": r.kgis_cadastral_id or "Not Available",
+                        "total_area": round(total_sqm, 2),
+                        "affected_area": round(affected_sqm, 2),
+                        "affected_percentage": affected_pct,
+                        "impact_type": impact_type,
+                        "road_name": road_name_val,
+                        "road_ref": road_ref_val,
+                        "corridor_width_m": corridor_width_val,
+                        "geometry": geom
+                    })
+
+            affected_list.sort(key=lambda x: x["affected_percentage"], reverse=True)
+
+            # Predict acquisition priority using trained ML Random Forest model
+            try:
+                from ml_service import predict_priority_batch
+                predict_priority_batch(affected_list)
+            except Exception as ml_err:
+                logger.warning(f"ML priority prediction notice: {ml_err}")
+
+            low_cnt = sum(1 for p in affected_list if p.get("priority") == "Low")
+            med_cnt = sum(1 for p in affected_list if p.get("priority") == "Medium")
+            high_cnt = sum(1 for p in affected_list if p.get("priority") == "High")
+
+            return {
+                "summary": {
+                    "total_affected_parcels": len(affected_list),
+                    "partial_impact_count": partial_count,
+                    "full_impact_count": full_count,
+                    "low_priority_count": low_cnt,
+                    "medium_priority_count": med_cnt,
+                    "high_priority_count": high_cnt,
+                    "priority_breakdown": {
+                        "low": low_cnt,
+                        "medium": med_cnt,
+                        "high": high_cnt
+                    },
+                    "impact_rule": f"Parcels with >= {impact_threshold}% area affected classified as Full Impact; < {impact_threshold}% classified as Partial Impact",
+                    "road_name": road_name_val,
+                    "road_ref": road_ref_val,
+                    "corridor_width": corridor_width_val,
+                    "calculation_engine": "PostgreSQL / PostGIS (EPSG:32643 UTM 43N)"
+                },
+                "parcels": affected_list
+            }
+        except Exception as e:
+            logger.warning(f"PostGIS intersection calculation notice, falling back to GeoPackage: {e}")
+
+    # Fallback to GeoPackage direct SQLite RTree query and Shapely + Pyproj
+    layer_name, srs_id = get_gpkg_layer_and_srs(GPKG_PATH)
+    corridor_shape = shapely.geometry.shape(geom_dict)
+    if not corridor_shape.is_valid:
+        corridor_shape = make_valid(corridor_shape)
+
+    cminx, cminy, cmaxx, cmaxy = corridor_shape.bounds
+    to_utm, to_wgs84 = get_utm_transformers()
+    corridor_utm = shapely.ops.transform(to_utm, corridor_shape)
+
+    transformer_3857_to_4326 = None
+    transformer_4326_to_3857 = None
+    if srs_id == 3857:
+        transformer_3857_to_4326 = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True).transform
+        transformer_4326_to_3857 = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
+
+    q_cminx, q_cminy, q_cmaxx, q_cmaxy = cminx, cminy, cmaxx, cmaxy
+    if transformer_4326_to_3857:
+        p1x, p1y = transformer_4326_to_3857(cminx, cminy)
+        p2x, p2y = transformer_4326_to_3857(cmaxx, cmaxy)
+        q_cminx, q_cmaxx = min(p1x, p2x), max(p1x, p2x)
+        q_cminy, q_cmaxy = min(p1y, p2y), max(p1y, p2y)
+
+    rtree_table = f"rtree_{layer_name}_geom"
+    conn = sqlite3.connect(GPKG_PATH)
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT 
+            p.fid, p.geom, p.surveynumberi, p.Label, p.Surveynumber_Old, 
+            p.KGISVillageCode, p.UniqueVillageCode, p.bhucode, p.LGD_VillageCode, 
+            p.Category, p."SHAPE.STArea()", p."SHAPE.STLength()", p.Kharab, p.ULPIN, p.KGISCadastralID
+        FROM "{rtree_table}" r
+        JOIN "{layer_name}" p ON r.id = p.fid
+        WHERE r.minx <= ? AND r.maxx >= ? AND r.miny <= ? AND r.maxy >= ?
+    """, (q_cmaxx, q_cminx, q_cmaxy, q_cminy))
+    rows = cursor.fetchall()
+    conn.close()
+
+    affected_list = []
+    partial_count = 0
+    full_count = 0
+    seen_fids = set()
+
+    for r in rows:
+        fid = r[0]
+        if fid in seen_fids:
+            continue
+        seen_fids.add(fid)
+
+        wkb = extract_wkb_from_gpkg_blob(r[1])
+        if not wkb:
+            continue
+        try:
+            parcel_shape = shapely.wkb.loads(wkb)
+            if transformer_3857_to_4326:
+                parcel_shape = shapely.ops.transform(transformer_3857_to_4326, parcel_shape)
+            if not parcel_shape.is_valid:
+                parcel_shape = make_valid(parcel_shape)
+
+            if parcel_shape.intersects(corridor_shape):
+                # Calculate metric areas in UTM Zone 43N
+                parcel_utm = shapely.ops.transform(to_utm, parcel_shape)
+                intersection_utm = parcel_utm.intersection(corridor_utm)
+                if intersection_utm.is_empty:
+                    continue
+
+                affected_sqm = round(intersection_utm.area, 2)
+                if affected_sqm <= 0.05:
+                    continue
+
+                total_sqm = float(r[10] or 0.0)
+                if total_sqm <= 0:
+                    total_sqm = round(parcel_utm.area, 2)
+
+                if total_sqm <= 0:
+                    total_sqm = affected_sqm
+
+                affected_pct = round(min(100.0, (affected_sqm / total_sqm) * 100.0), 2)
+                impact_type = "Full Impact" if affected_pct >= float(impact_threshold) else "Partial Impact"
+
+                if impact_type == "Full Impact":
+                    full_count += 1
+                else:
+                    partial_count += 1
+
+                survey_no = str(r[2]) if r[2] is not None and str(r[2]) != 'None' else (str(r[3]) if r[3] and str(r[3]) != 'None' else "Not Available")
+                parcel_id = str(r[14]) if r[14] and str(r[14]) != 'None' else (str(r[13]) if r[13] and str(r[13]) != 'None' else f"PARCEL-{fid}")
+                lgd_code_val = r[8]
+                village_name = lookup_village_name(lgd_code_val)
+
+                affected_list.append({
+                    "id": fid,
+                    "parcel_id": parcel_id,
+                    "survey_number": survey_no,
+                    "village": village_name,
+                    "village_code": r[5] or "Not Available",
+                    "lgd_village_code": lgd_code_val if lgd_code_val is not None else "Not Available",
+                    "category": r[9] or "Parcel",
+                    "ulpin": r[13] or "Not Available",
+                    "kgis_cadastral_id": r[14] or "Not Available",
+                    "total_area": round(total_sqm, 2),
+                    "affected_area": affected_sqm,
+                    "affected_percentage": affected_pct,
+                    "impact_type": impact_type,
+                    "road_name": road_name_val,
+                    "road_ref": road_ref_val,
+                    "corridor_width_m": corridor_width_val,
+                    "geometry": shapely.geometry.mapping(parcel_shape)
+                })
+        except Exception as e:
+            logger.debug(f"Error computing intersection for FID {r[0]}: {e}")
+            continue
+
+    affected_list.sort(key=lambda x: x["affected_percentage"], reverse=True)
+
+    # Predict acquisition priority using trained ML Random Forest model
+    try:
+        from ml_service import predict_priority_batch
+        predict_priority_batch(affected_list)
+    except Exception as ml_err:
+        logger.warning(f"ML priority prediction notice: {ml_err}")
+
+    low_cnt = sum(1 for p in affected_list if p.get("priority") == "Low")
+    med_cnt = sum(1 for p in affected_list if p.get("priority") == "Medium")
+    high_cnt = sum(1 for p in affected_list if p.get("priority") == "High")
+
+    return {
+        "summary": {
+            "total_affected_parcels": len(affected_list),
+            "partial_impact_count": partial_count,
+            "full_impact_count": full_count,
+            "low_priority_count": low_cnt,
+            "medium_priority_count": med_cnt,
+            "high_priority_count": high_cnt,
+            "priority_breakdown": {
+                "low": low_cnt,
+                "medium": med_cnt,
+                "high": high_cnt
+            },
+            "impact_rule": f"Parcels with >= {impact_threshold}% area affected classified as Full Impact; < {impact_threshold}% classified as Partial Impact",
+            "road_name": road_name_val,
+            "road_ref": road_ref_val,
+            "corridor_width": corridor_width_val,
+            "calculation_engine": "OGC GeoPackage + Pyproj (EPSG:32643 UTM 43N)"
+        },
+        "parcels": affected_list
+    }
+
+
+
