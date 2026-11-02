@@ -240,7 +240,7 @@ export default function AffectedParcels({ onNavigateToMap }) {
                           {p.parcel_id || 'Not Available'}
                         </td>
                         <td style={{ padding: '10px 12px', fontSize: '13px', fontWeight: 700, color: '#0f172a' }}>
-                          {p.survey_number || 'Not Available'}
+                          {p.survey_number && String(p.survey_number).trim() !== '0' ? p.survey_number : 'Not Available'}
                         </td>
                         <td style={{ padding: '10px 12px', fontSize: '12.5px', textAlign: 'right', color: '#334155' }}>
                           {Number(p.total_area).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 2 })}

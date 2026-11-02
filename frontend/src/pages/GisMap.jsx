@@ -227,15 +227,18 @@ export default function GisMap() {
   // Displays full attribute details for both affected and unaffected parcels.
   const createPopupContent = useCallback((props) => {
     if (!props) return '';
-    const surveyNo = props.survey_number && props.survey_number !== 'None' ? props.survey_number : (props.Label || 'Not Available');
+    const rawSurvey = props.survey_number != null ? String(props.survey_number).trim() : '';
+    const surveyNo = (rawSurvey && rawSurvey !== '0' && rawSurvey !== 'None')
+      ? rawSurvey
+      : (props.Label && String(props.Label).trim() !== '0' && String(props.Label).trim() !== '' ? String(props.Label).trim() : 'Not Available');
     const lgdCode = props.lgd_village_code && props.lgd_village_code !== 'None' ? props.lgd_village_code : 'Not Available';
     const village = getVillageName(lgdCode, props.village);
     const villageCode = props.village_code && props.village_code !== 'None' ? props.village_code : 'Not Available';
     const ulpin = props.ulpin && props.ulpin !== 'None' ? props.ulpin : 'Not Available';
 
-    const totalAreaNum = typeof props.area_sqm === 'number'
-      ? props.area_sqm
-      : (typeof props.total_area === 'number' ? props.total_area : null);
+    const totalAreaNum = typeof props.total_area === 'number'
+      ? props.total_area
+      : (typeof props.area_sqm === 'number' ? props.area_sqm : null);
     const areaSqm = totalAreaNum !== null ? totalAreaNum.toLocaleString('en-IN') : 'Not Available';
     const areaAcres = totalAreaNum !== null
       ? (typeof props.area_acres === 'number' ? props.area_acres.toFixed(3) : (totalAreaNum / 4046.86).toFixed(3))
@@ -264,7 +267,7 @@ export default function GisMap() {
           <div class="parcel-popup-title">
             <span>${isAffected ? `⚠️ ${priority ? `${priority} Priority` : impactType}` : 'Land Parcel'}</span>
           </div>
-          <span style="font-size: 10px; background: rgba(255,255,255,0.25); padding: 2px 7px; border-radius: 3px; font-weight: 700; color: #fff;">
+          <span style="font-size: 10px; background: rgba(255,255,255,0.25); padding: 2px 7px; border-radius: 3px; font-weight: 700; color: #b8b5b5ff;">
             ${isAffected ? `${affectedPct} Impact` : `Survey No: ${surveyNo}`}
           </span>
         </div>
@@ -449,6 +452,9 @@ export default function GisMap() {
     setCorridorNotice(null);
     setAffectedParcels([]);
     setAffectedSummary(null);
+    try {
+      localStorage.removeItem('landtrack_affected_parcels');
+    } catch (_) {}
 
     // Clean up any existing corridor layer and affected parcels layer
     if (corridorLayerRef.current && mapInstanceRef.current) {
@@ -527,6 +533,9 @@ export default function GisMap() {
     setCorridorNotice(null);
     setAffectedParcels([]);
     setAffectedSummary(null);
+    try {
+      localStorage.removeItem('landtrack_affected_parcels');
+    } catch (_) {}
 
     if (selectedRoadHighlightRef.current && mapInstanceRef.current) {
       mapInstanceRef.current.removeLayer(selectedRoadHighlightRef.current);
@@ -713,12 +722,12 @@ export default function GisMap() {
               if (interArea <= 0.05) continue;
 
               const geomArea = area(pFeat) > 0 ? Math.round(area(pFeat) * 100) / 100 : 0;
-              const affectedArea = Math.round(interArea * 100) / 100;
-              let totalArea = geomArea || p.properties?.area_sqm || 1000;
-              if (totalArea <= 0 || totalArea < affectedArea) {
-                totalArea = affectedArea;
+              let affectedArea = Math.round(interArea * 100) / 100;
+              let totalArea = geomArea || p.properties?.total_area || p.properties?.area_sqm || 1000;
+              if (affectedArea > totalArea) {
+                affectedArea = totalArea;
               }
-              const affectedPct = Math.min(100, Math.max(0, Math.round((affectedArea / totalArea) * 10000) / 100));
+              const affectedPct = totalArea > 0 ? Math.min(100, Math.max(0, Math.round((affectedArea / totalArea) * 10000) / 100)) : 0;
               const impactType = affectedPct >= thresholdVal ? 'Full Impact' : 'Partial Impact';
 
               if (impactType === 'Full Impact') fullCount++;
@@ -818,6 +827,7 @@ export default function GisMap() {
 
     parcels = genuinelyAffectedParcels;
     summary = {
+      ...(summary || {}),
       total_affected_parcels: parcels.length,
       partial_impact_count: genuinePartial,
       full_impact_count: genuineFull
@@ -2793,6 +2803,9 @@ export default function GisMap() {
                         setCorridorCreated(false);
                         setAffectedParcels([]);
                         setAffectedSummary(null);
+                        try {
+                          localStorage.removeItem('landtrack_affected_parcels');
+                        } catch (_) {}
                         if (corridorLayerRef.current && mapInstanceRef.current) {
                           mapInstanceRef.current.removeLayer(corridorLayerRef.current);
                           corridorLayerRef.current = null;

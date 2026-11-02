@@ -2368,3 +2368,292 @@ body {
   pointer-events: auto !important;
   cursor: pointer;
 }
+
+/* ====================================================================
+   PRINT & PDF EXPORT STYLES (Land Acquisition Assessment Report)
+   Hides website navbar, header, breadcrumbs, footers, buttons, and chrome.
+   Prints clean report document with title, metadata, summary cards,
+   parcel impact table, and ML priority tags.
+   ==================================================================== */
+@media print {
+  /* 1. Page Setup: Standard A4 Portrait with Professional Margins */
+  @page {
+    size: A4 portrait;
+    margin: 14mm 16mm 14mm 16mm;
+  }
+
+  /* 2. Full Color Fidelity: Force Browser to Print Background Colors & Borders */
+  *,
+  *::before,
+  *::after {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-adjust: exact !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+
+  /* 3. Hide Website Navigation, Header, Breadcrumbs, Footer, Buttons & UI Controls */
+  header,
+  footer,
+  nav,
+  .header-glass-wrapper,
+  .top-dark-glass-bar,
+  .main-portal-header,
+  .header-brand,
+  .header-nav,
+  .page-substrip,
+  .breadcrumb-trail,
+  .tricolor-stripe,
+  .portal-footer-glass,
+  .gov-card-header,
+  .no-print,
+  button,
+  .gov-btn,
+  .leaflet-control-container,
+  .leaflet-pane,
+  .leaflet-top,
+  .leaflet-bottom,
+  .sidebar,
+  .dashboard-glass-portal,
+  .highway-hero-container,
+  .overview-glass-section,
+  .gis-featured-visual-section,
+  .alternating-portal-sections,
+  .dashboard-bottom-bar,
+  .toast,
+  .modal,
+  .modal-backdrop,
+  .tooltip,
+  .popover {
+    display: none !important;
+    visibility: hidden !important;
+    height: 0 !important;
+    width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+  }
+
+  /* 4. Canvas & Layout Resets: Clean White Page */
+  html,
+  body,
+  #root,
+  .portal-root,
+  .main-wrapper,
+  .reports-page {
+    background: #ffffff !important;
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-height: auto !important;
+    height: auto !important;
+    overflow: visible !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  /* 5. Report Document Container */
+  .gov-card,
+  .report-print-container {
+    background: transparent !important;
+    background-color: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  .gov-card-body,
+  .report-printable-content {
+    padding: 0 !important;
+    margin: 0 !important;
+    background: transparent !important;
+    width: 100% !important;
+  }
+
+  /* 6. Document Header Banner */
+  .report-header-banner {
+    text-align: center !important;
+    border-bottom: 2.5px solid #173b63 !important;
+    padding-bottom: 12px !important;
+    margin-bottom: 16px !important;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+  }
+
+  .report-header-banner h2 {
+    font-size: 22px !important;
+    font-weight: 800 !important;
+    color: #173b63 !important;
+    letter-spacing: 0.8px !important;
+    margin: 0 0 4px 0 !important;
+    text-transform: uppercase !important;
+  }
+
+  .report-header-banner h3 {
+    font-size: 15px !important;
+    font-weight: 700 !important;
+    color: #204e80 !important;
+    margin: 0 0 4px 0 !important;
+  }
+
+  .report-header-banner div {
+    font-size: 11px !important;
+    color: #64748b !important;
+    font-weight: 500 !important;
+  }
+
+  /* 7. Study Area & Road Details (Metadata Box) */
+  .grid-2.report-meta-block {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    gap: 16px !important;
+    background-color: #f8fafc !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 4px !important;
+    padding: 12px 16px !important;
+    margin-bottom: 18px !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  .grid-2.report-meta-block .gov-kv-row {
+    display: flex !important;
+    padding: 4px 0 !important;
+    border-bottom: 1px solid #e2e8f0 !important;
+    font-size: 11px !important;
+  }
+
+  .grid-2.report-meta-block .gov-kv-row:last-child {
+    border-bottom: none !important;
+  }
+
+  .grid-2.report-meta-block .gov-kv-label {
+    width: 130px !important;
+    font-weight: 600 !important;
+    color: #475569 !important;
+  }
+
+  .grid-2.report-meta-block .gov-kv-val {
+    font-weight: 700 !important;
+    color: #0f172a !important;
+  }
+
+  /* 8. Section Headings */
+  .report-section-title {
+    font-size: 12.5px !important;
+    font-weight: 800 !important;
+    color: #173b63 !important;
+    margin-top: 14px !important;
+    margin-bottom: 8px !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.4px !important;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+  }
+
+  /* 9. Executive Summary Cards */
+  .grid-4.report-summary-grid {
+    display: grid !important;
+    grid-template-columns: repeat(4, 1fr) !important;
+    gap: 10px !important;
+    margin-bottom: 18px !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  .report-stat-card {
+    background-color: #ffffff !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 4px !important;
+    padding: 10px 8px !important;
+    text-align: center !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  .report-stat-card > div:first-child {
+    font-size: 10px !important;
+    text-transform: uppercase !important;
+    color: #64748b !important;
+    font-weight: 600 !important;
+    margin-bottom: 4px !important;
+  }
+
+  .report-stat-card > div:last-child {
+    font-size: 18px !important;
+    font-weight: 800 !important;
+  }
+
+  /* 10. Land Parcel Impact Schedule Table */
+  .gov-table-wrapper.report-table-wrapper {
+    overflow: visible !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 4px !important;
+    margin-bottom: 18px !important;
+    box-shadow: none !important;
+  }
+
+  .gov-table.report-table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    font-size: 10px !important;
+    page-break-inside: auto !important;
+  }
+
+  .gov-table.report-table thead {
+    display: table-header-group !important;
+  }
+
+  .gov-table.report-table tr {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  .gov-table.report-table th {
+    background-color: #f1f5f9 !important;
+    color: #173b63 !important;
+    font-weight: 700 !important;
+    font-size: 9.5px !important;
+    padding: 6px 8px !important;
+    border-bottom: 1.5px solid #cbd5e1 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.3px !important;
+  }
+
+  .gov-table.report-table td {
+    padding: 6px 8px !important;
+    border-bottom: 1px solid #e2e8f0 !important;
+    color: #1e293b !important;
+    font-size: 10px !important;
+  }
+
+  /* Impact & Priority Tags in Print */
+  .gov-table.report-table span {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /* 11. Report Summary Footer Notice */
+  .report-footer-notice {
+    background-color: #f8fafc !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 4px !important;
+    padding: 10px !important;
+    font-size: 9.5px !important;
+    color: #64748b !important;
+    text-align: center !important;
+    font-weight: 500 !important;
+    margin-top: 10px !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+}

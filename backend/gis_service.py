@@ -199,7 +199,17 @@ def get_cadastral_parcels_postgis(minx=None, miny=None, maxx=None, maxy=None, su
             acres = round(area_m2 / 4046.86, 3)
             
             # Format display survey number
-            survey_display = str(r.survey_number) if r.survey_number is not None else (r.survey_number_label or "Not Available")
+            raw_sn = r.survey_number
+            cat_val = r.category or "Parcel"
+            if raw_sn is not None and isinstance(raw_sn, (int, float)) and int(raw_sn) > 0:
+                survey_display = str(int(raw_sn))
+            elif r.survey_number_label and str(r.survey_number_label).strip() and str(r.survey_number_label).strip() not in ('0', 'None', ''):
+                survey_display = str(r.survey_number_label).strip()
+            else:
+                if cat_val in ("Road", "River", "Stream", "Tank"):
+                    survey_display = f"Unassigned ({cat_val})"
+                else:
+                    survey_display = "Not Available"
             
             features.append({
                 "type": "Feature",
@@ -363,7 +373,16 @@ def get_cadastral_parcels_gpkg(minx=None, miny=None, maxx=None, maxy=None, surve
             continue
 
         survey_val = r[2]
-        survey_display = str(survey_val) if survey_val is not None else (r[3] or "Not Available")
+        cat_val = r[9] or "Parcel"
+        if survey_val is not None and isinstance(survey_val, (int, float)) and int(survey_val) > 0:
+            survey_display = str(int(survey_val))
+        elif r[3] and str(r[3]).strip() and str(r[3]).strip() not in ('0', 'None', ''):
+            survey_display = str(r[3]).strip()
+        else:
+            if cat_val in ("Road", "River", "Stream", "Tank"):
+                survey_display = f"Unassigned ({cat_val})"
+            else:
+                survey_display = "Not Available"
         area_m2 = r[10] or 0.0
         acres = round(area_m2 / 4046.86, 3)
 
@@ -1110,7 +1129,7 @@ def intersect_corridor_with_parcels(corridor_geojson, impact_threshold=90.0, roa
                     p.ulpin,
                     p.kgis_cadastral_id,
                     ST_Area(ST_Transform(p.geom, 32643)) as calc_total_sqm,
-                    ST_Area(ST_Transform(ST_Intersection(p.geom, ST_SetSRID(ST_GeomFromGeoJSON(:corridor_json), 4326)), 32643)) as calc_affected_sqm,
+                    ST_Area(ST_Intersection(ST_Transform(p.geom, 32643), ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON(:corridor_json), 4326), 32643))) as calc_affected_sqm,
                     ST_AsGeoJSON(p.geom) as geom_json
                 FROM cadastral_parcels p
                 WHERE ST_Intersects(p.geom, ST_SetSRID(ST_GeomFromGeoJSON(:corridor_json), 4326))
@@ -1136,13 +1155,17 @@ def intersect_corridor_with_parcels(corridor_geojson, impact_threshold=90.0, roa
                     if affected_sqm <= 0:
                         continue
 
-                    # Ensure physical consistency: total parcel area can never be less than affected area
+                    # Ensure physical consistency without artificial clamping of total area:
+                    # In Euclidean space, intersection cannot exceed the polygon. Address any IEEE-754 precision noise (<0.01 m2)
                     total_area_val = round(total_sqm, 2)
                     affected_area_val = round(affected_sqm, 2)
-                    if total_area_val <= 0 or total_area_val < affected_area_val:
+                    if total_area_val <= 0:
                         total_area_val = affected_area_val
+                    elif affected_area_val > total_area_val:
+                        affected_area_val = total_area_val
 
-                    affected_pct = round(min(100.0, max(0.0, (affected_area_val / total_area_val) * 100.0)), 2)
+                    affected_pct = round((affected_area_val / total_area_val) * 100.0, 2)
+                    affected_pct = min(100.0, max(0.01, affected_pct))
                     impact_type = "Full Impact" if affected_pct >= float(impact_threshold) else "Partial Impact"
 
                     if impact_type == "Full Impact":
@@ -1150,7 +1173,17 @@ def intersect_corridor_with_parcels(corridor_geojson, impact_threshold=90.0, roa
                     else:
                         partial_count += 1
 
-                    survey_no = str(r.survey_number) if r.survey_number is not None and str(r.survey_number) != 'None' else (str(r.survey_number_label) if r.survey_number_label and str(r.survey_number_label) != 'None' else "Not Available")
+                    raw_sn = r.survey_number
+                    cat_val = r.category or "Parcel"
+                    if raw_sn is not None and isinstance(raw_sn, (int, float)) and int(raw_sn) > 0:
+                        survey_no = str(int(raw_sn))
+                    elif r.survey_number_label and str(r.survey_number_label).strip() and str(r.survey_number_label).strip() not in ('0', 'None', ''):
+                        survey_no = str(r.survey_number_label).strip()
+                    else:
+                        if cat_val in ("Road", "River", "Stream", "Tank"):
+                            survey_no = f"Unassigned ({cat_val})"
+                        else:
+                            survey_no = "Not Available"
                     parcel_id = str(r.kgis_cadastral_id) if r.kgis_cadastral_id and str(r.kgis_cadastral_id) != 'None' else (str(r.ulpin) if r.ulpin and str(r.ulpin) != 'None' else f"PARCEL-{fid}")
                     village_name = lookup_village_name(r.lgd_village_code)
                     geom = json.loads(r.geom_json) if r.geom_json else None
@@ -1287,10 +1320,14 @@ def intersect_corridor_with_parcels(corridor_geojson, impact_threshold=90.0, roa
                 total_sqm = float(geom_area or r[10] or 0.0)
                 affected_area_val = round(affected_sqm, 2)
                 total_area_val = round(total_sqm, 2)
-                if total_area_val <= 0 or total_area_val < affected_area_val:
+                if total_area_val <= 0:
                     total_area_val = affected_area_val
+                elif affected_area_val > total_area_val:
+                    # Physically bounded: intersection cannot exceed total parcel area
+                    affected_area_val = total_area_val
 
-                affected_pct = round(min(100.0, max(0.0, (affected_area_val / total_area_val) * 100.0)), 2)
+                affected_pct = round((affected_area_val / total_area_val) * 100.0, 2)
+                affected_pct = min(100.0, max(0.01, affected_pct))
                 impact_type = "Full Impact" if affected_pct >= float(impact_threshold) else "Partial Impact"
 
                 if impact_type == "Full Impact":
@@ -1298,7 +1335,17 @@ def intersect_corridor_with_parcels(corridor_geojson, impact_threshold=90.0, roa
                 else:
                     partial_count += 1
 
-                survey_no = str(r[2]) if r[2] is not None and str(r[2]) != 'None' else (str(r[3]) if r[3] and str(r[3]) != 'None' else "Not Available")
+                raw_surv = r[2]
+                cat_val = r[9] or "Parcel"
+                if raw_surv is not None and isinstance(raw_surv, (int, float)) and int(raw_surv) > 0:
+                    survey_no = str(int(raw_surv))
+                elif r[3] and str(r[3]).strip() and str(r[3]).strip() not in ('0', 'None', ''):
+                    survey_no = str(r[3]).strip()
+                else:
+                    if cat_val in ("Road", "River", "Stream", "Tank"):
+                        survey_no = f"Unassigned ({cat_val})"
+                    else:
+                        survey_no = "Not Available"
                 parcel_id = str(r[14]) if r[14] and str(r[14]) != 'None' else (str(r[13]) if r[13] and str(r[13]) != 'None' else f"PARCEL-{fid}")
                 lgd_code_val = r[8]
                 village_name = lookup_village_name(lgd_code_val)

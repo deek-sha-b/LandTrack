@@ -19,12 +19,12 @@ export default function Reports({ onNavigateToMap }) {
 
   return (
     <div className="reports-page">
-      <div className="gov-card">
-        <div className="gov-card-header">
+      <div className="gov-card report-print-container">
+        <div className="gov-card-header no-print">
           <div className="gov-card-title">Land Acquisition Assessment Report</div>
           <button 
             type="button" 
-            className="gov-btn gov-btn-secondary" 
+            className="gov-btn gov-btn-secondary no-print" 
             style={{ padding: '4px 12px', fontSize: '12px' }}
             onClick={() => window.print()}
             disabled={parcels.length === 0}
@@ -33,9 +33,9 @@ export default function Reports({ onNavigateToMap }) {
           </button>
         </div>
 
-        <div className="gov-card-body" style={{ padding: '30px' }}>
+        <div className="gov-card-body report-printable-content" style={{ padding: '30px' }}>
           {/* Report Header */}
-          <div style={{ textAlign: 'center', borderBottom: '2px solid var(--gov-navy)', paddingBottom: '16px', marginBottom: '24px' }}>
+          <div className="report-header-banner" style={{ textAlign: 'center', borderBottom: '2px solid var(--gov-navy)', paddingBottom: '16px', marginBottom: '24px' }}>
             <h2 style={{ fontSize: '20px', fontWeight: 800, color: 'var(--gov-navy)', letterSpacing: '0.5px' }}>
               LANDTRACK
             </h2>
@@ -48,7 +48,7 @@ export default function Reports({ onNavigateToMap }) {
           </div>
 
           {/* Report Metadata Block */}
-          <div className="grid-2" style={{ marginBottom: '24px', backgroundColor: '#f8fafc', padding: '16px', border: '1px solid var(--border-color)' }}>
+          <div className="grid-2 report-meta-block" style={{ marginBottom: '24px', backgroundColor: '#f8fafc', padding: '16px', border: '1px solid var(--border-color)' }}>
             <div>
               <div className="gov-kv-row">
                 <div className="gov-kv-label">Study Area:</div>
@@ -56,7 +56,11 @@ export default function Reports({ onNavigateToMap }) {
               </div>
               <div className="gov-kv-row">
                 <div className="gov-kv-label">Selected Road:</div>
-                <div className="gov-kv-val">{reportData?.roadName || 'Awaiting Selection'}</div>
+                <div className="gov-kv-val">
+                  {reportData?.roadName 
+                    ? `${reportData.roadName}${reportData?.roadRef ? ` (${reportData.roadRef})` : ''}` 
+                    : 'Awaiting Selection'}
+                </div>
               </div>
             </div>
             <div>
@@ -66,35 +70,39 @@ export default function Reports({ onNavigateToMap }) {
               </div>
               <div className="gov-kv-row">
                 <div className="gov-kv-label">Analysis Date:</div>
-                <div className="gov-kv-val">{new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })}</div>
+                <div className="gov-kv-val">
+                  {reportData?.calculatedAt 
+                    ? new Date(reportData.calculatedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
+                    : new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })}
+                </div>
               </div>
             </div>
           </div>
 
           {/* Summary Block */}
-          <h4 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--gov-navy)', marginBottom: '10px', textTransform: 'uppercase' }}>
+          <h4 className="report-section-title" style={{ fontSize: '14px', fontWeight: 700, color: 'var(--gov-navy)', marginBottom: '10px', textTransform: 'uppercase' }}>
             1. Executive Summary
           </h4>
-          <div className="grid-4" style={{ marginBottom: '24px' }}>
-            <div style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
+          <div className="grid-4 report-summary-grid" style={{ marginBottom: '24px' }}>
+            <div className="report-stat-card" style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
               <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Affected Parcels</div>
               <div style={{ fontSize: '20px', fontWeight: 700, color: 'var(--gov-navy)' }}>
                 {parcels.length > 0 ? parcels.length : '--'}
               </div>
             </div>
-            <div style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
+            <div className="report-stat-card" style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
               <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Total Affected Area</div>
               <div style={{ fontSize: '20px', fontWeight: 700, color: 'var(--gov-navy)' }}>
                 {parcels.length > 0 ? `${Math.round(totalArea).toLocaleString('en-IN')} m²` : '-- m²'}
               </div>
             </div>
-            <div style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
+            <div className="report-stat-card" style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
               <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Partial Parcels</div>
               <div style={{ fontSize: '20px', fontWeight: 700, color: 'var(--gov-navy-light)' }}>
                 {parcels.length > 0 ? (summary?.partial_impact_count ?? parcels.filter(p => p.impact_type === 'Partial Impact').length) : '--'}
               </div>
             </div>
-            <div style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
+            <div className="report-stat-card" style={{ padding: '12px', border: '1px solid var(--border-color)', backgroundColor: '#ffffff', textAlign: 'center' }}>
               <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Full Parcels</div>
               <div style={{ fontSize: '20px', fontWeight: 700, color: '#b91c1c' }}>
                 {parcels.length > 0 ? (summary?.full_impact_count ?? parcels.filter(p => p.impact_type === 'Full Impact').length) : '--'}
@@ -103,11 +111,11 @@ export default function Reports({ onNavigateToMap }) {
           </div>
 
           {/* Parcel-wise Results Table */}
-          <h4 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--gov-navy)', marginBottom: '10px', textTransform: 'uppercase' }}>
+          <h4 className="report-section-title" style={{ fontSize: '14px', fontWeight: 700, color: 'var(--gov-navy)', marginBottom: '10px', textTransform: 'uppercase' }}>
             2. Land Parcel Impact Schedule &amp; Priority Classification
           </h4>
-          <div className="gov-table-wrapper" style={{ marginBottom: '24px', overflowX: 'auto' }}>
-            <table className="gov-table">
+          <div className="gov-table-wrapper report-table-wrapper" style={{ marginBottom: '24px', overflowX: 'auto' }}>
+            <table className="gov-table report-table">
               <thead>
                 <tr>
                   <th>Survey Number</th>
@@ -129,7 +137,9 @@ export default function Reports({ onNavigateToMap }) {
                     const prioBorder = prio === 'High' ? '#FECACA' : (prio === 'Medium' ? '#FDE68A' : '#BFDBFE');
                     return (
                       <tr key={p.id || p.parcel_id || idx}>
-                        <td style={{ fontWeight: 700, color: '#0f172a' }}>{p.survey_number || 'Not Available'}</td>
+                        <td style={{ fontWeight: 700, color: '#0f172a' }}>
+                          {p.survey_number && String(p.survey_number).trim() !== '0' ? p.survey_number : 'Not Available'}
+                        </td>
                         <td>{p.village || 'Puttur'}</td>
                         <td style={{ textAlign: 'right' }}>{Number(p.total_area).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 2 })}</td>
                         <td style={{ textAlign: 'right', fontWeight: 700, color: isFull ? '#b91c1c' : '#c2410c' }}>
@@ -184,7 +194,7 @@ export default function Reports({ onNavigateToMap }) {
           </div>
 
           {/* Report Summary Notice */}
-          <div style={{ backgroundColor: '#f8fafc', border: '1px solid var(--border-color)', padding: '14px', fontSize: '12px', color: 'var(--text-muted)', textAlign: 'center', fontWeight: 500 }}>
+          <div className="report-footer-notice" style={{ backgroundColor: '#f8fafc', border: '1px solid var(--border-color)', padding: '14px', fontSize: '12px', color: 'var(--text-muted)', textAlign: 'center', fontWeight: 500 }}>
             LandTrack Land Acquisition Management &bull; Corridor Evaluation and Land Survey Report &bull; Powered by ML Priority Classifier
           </div>
         </div>
